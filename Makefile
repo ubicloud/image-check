@@ -12,13 +12,16 @@ ALMA_IMAGES := $(filter AlmaLinux-%,$(IMAGES))
 # Interleave images from different sources
 ORDERED_IMAGES := $(sort $(foreach i,$(shell seq 1 20),$(word $i,$(UBUNTU_IMAGES)) $(word $i,$(DEBIAN_IMAGES)) $(word $i,$(ALMA_IMAGES))))
 
-.PHONY: all download checksums clean distclean
+.PHONY: all download checksums clean distclean scrape
 
 all: download checksums
 
 download: $(ORDERED_IMAGES)
 
 checksums: $(addsuffix .sha256,$(IMAGES))
+
+scrape:
+	./scrape
 
 $(IMAGES):
 	@echo "Downloading $@ ..."

@@ -1,0 +1,88 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'net/http'
+require 'uri'
+require 'time'
+
+class CloudImageScraper
+  UBUNTU_BASE = 'https://cloud-images.ubuntu.com/releases/'
+  DEBIAN_BASE = 'https://cloud.debian.org/images/cloud/bookworm/'
+  ALMALINUX_BASE = 'https://repo.almalinux.org/almalinux/9/cloud/'
+  ALPINE_BASE = 'https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/'
+
+  def get(url, range = nil) = URI.parse(url).then do |uri|
+    Net::HTTP.new(uri.host, uri.port).tap do
+      it.use_ssl = uri.scheme == 'https'
+      it.open_timeout = it.read_timeout = 30
+    end.request(Net::HTTP::Get.new(uri.request_uri).tap { it['Range'] = range if range })
+  end
+
+  def scan(url, regex) = get(url).then { it.code == '200' ? it.body.scan(regex) : [] }
+  def ok?(url) = get(url, 'bytes=0-1023').then { %w[200 206 302].include?(it.code) }
+
+  def scrape_ubuntu = [%w[noble 24.04], %w[jammy 22.04]].flat_map do |codename, version|
+    scan("#{UBUNTU_BASE}#{codename}/", %r{href="(release-[^"]+)/}).flatten.max&.then do |latest_dir|
+      scan("#{UBUNTU_BASE}#{codename}/#{latest_dir}/", /href="([^"]*server-cloudimg-(amd64|arm64)\.img)"/)
+        .reject { it.first.include?('.manifest') }
+        .map do |file, arch|
+        ["ubuntu-#{version}-server-cloudimg-#{arch}.img",
+         "#{UBUNTU_BASE}#{codename}/#{latest_dir}/#{file}"]
+      end
+    end || []
+  end.to_h
+
+  def scrape_debian = scan(DEBIAN_BASE, %r{href="(\d{8}-\d{4})/}).flatten.max&.then do |latest_dir|
+    scan("#{DEBIAN_BASE}#{latest_dir}/", /href="([^"]*genericcloud-(amd64|arm64)[^"]*\.raw)"/)
+      .to_h { |file, arch| ["debian-12-genericcloud-#{arch}.raw", "#{DEBIAN_BASE}#{latest_dir}/#{file}"] }
+  end || {}
+
+  def scrape_almalinux = %w[x86_64 aarch64].filter_map do |arch|
+    scan("#{ALMALINUX_BASE}#{arch}/images/", /href="(AlmaLinux-\d+-GenericCloud-[\d.]+-(\d{8})\.#{arch}\.qcow2)"/)
+      .reject { it.first.include?('latest') }
+      .max_by(&:last)&.then do |latest|
+      ["AlmaLinux-9-GenericCloud.#{arch}.qcow2",
+       "#{ALMALINUX_BASE}#{arch}/images/#{latest.first}"]
+    end
+  end.to_h
+
+  def scrape_alpine = scan(ALPINE_BASE,
+                           /href="(nocloud_alpine-(\d+\.\d+\.\d+)-(x86_64|aarch64)-uefi-cloudinit-r\d+\.qcow2)"/)
+    .group_by(&:last)
+    .filter_map do |arch, files|
+    files.max_by { it[1].split('.').map(&:to_i) }&.then do |latest|
+      ["alpine-3.21-nocloud-uefi-#{arch == 'x86_64' ? 'x86_64' : 'arm64'}.qcow2", ALPINE_BASE + latest.first]
+    end
+  end.to_h
+
+  def run
+    warn 'Fetching latest cloud image URLs...'
+
+    all_images = %i[scrape_ubuntu scrape_debian scrape_almalinux scrape_alpine]
+                 .map { |m| Thread.new { method(m).call } }.map(&:value).reduce(&:merge)
+
+    warn "Found #{all_images.length} cloud images, verifying..."
+
+    verified_images = all_images.map { |key, url| Thread.new { [key, url, ok?(url)] } }.map(&:value)
+                                .filter_map do |key, url, is_ok|
+      if is_ok
+        (warn("✓ #{url}")
+         [key, url])
+      else
+        (warn("✗ #{url}")
+         nil)
+      end
+    end.to_h
+
+    warn "Verified #{verified_images.length}/#{all_images.length} URLs"
+
+    verified_images.sort_by(&:first).map { |_, url| "URL_#{File.basename(url)} := #{url}" }
+                   .prepend("# Updated Cloud Image URLs - Generated on #{Time.now.strftime('%Y-%m-%d %H:%M:%S')}",
+                            "# Verified #{verified_images.length}/#{all_images.length} URLs accessible", '')
+                   .then { File.write('urls.mk', it.join("\n")) }
+
+    warn 'Makefile saved to: urls.mk'
+  end
+end
+
+CloudImageScraper.new.run if __FILE__ == $PROGRAM_NAME
